@@ -83,6 +83,7 @@ class OSM3DBuilder:
             return "SAFE", "No buildings nearby.", 9999
 
         # 1. PROJECT TO UTM (METERS)
+        # We must project to a metric CRS to measure 5 meters accurately.
         utm_crs = self.footprints.estimate_utm_crs()
         gdf_buildings_utm = self.footprints.to_crs(utm_crs)
         
@@ -91,17 +92,17 @@ class OSM3DBuilder:
         gdf_poi_utm = gdf_poi.to_crs(utm_crs)
         poi_point_utm = gdf_poi_utm.geometry.iloc[0]
 
-        # 2. CHECK: COLLISION
+        # 2. CHECK: COLLISION (Is point INSIDE a building?)
         is_inside = gdf_buildings_utm.contains(poi_point_utm).any()
         if is_inside:
-            return "COLLISION", "CRITICAL: The selected site falls directly on an existing building structure.", 0
+            return "COLLISION", "The selected site falls directly on an existing building structure.", 0
 
-        # 3. CHECK: PROXIMITY
+        # 3. CHECK: PROXIMITY (Is point within 5m?)
         distances = gdf_buildings_utm.distance(poi_point_utm)
         min_dist = distances.min()
         
         if min_dist <= 5.0:
-            return "VIOLATION", f"REGULATORY NOTICE: Site is {min_dist:.2f}m from a building. This violates NCC Setback Regulations (Minimum 5m).", min_dist
+            return "VIOLATION", f"Site is {min_dist:.2f}m from a building. This violates NCC Setback Regulations (Minimum 5m).", min_dist
 
         return "SAFE", f"Site is Compliant. Nearest building is {min_dist:.2f}m away.", min_dist
 
@@ -141,22 +142,32 @@ class OSM3DBuilder:
 
 st.title("📡 3D Telecom Site Planner & Compliance Check")
 
+# Initialize Session State for First Run
+if "first_run" not in st.session_state:
+    st.session_state.first_run = True
+
 with st.sidebar:
     st.header("📍 Site Configuration")
-    lat = st.number_input("Latitude", value=6.457211, format="%.6f")
-    lon = st.number_input("Longitude", value=3.559664, format="%.6f")
     
-    st.header("📏 Parameters")
-    radius = st.slider("Search Radius (m)", 100, 800, 300)
-    tower_height = st.slider("Tower Height (m)", 10, 100, 30)
-    
-    # --- HIDDEN/ADVANCED SETTINGS ---
-    with st.expander("🛠️ Advanced Settings (Height Simulation)"):
-        st.caption("If OSM data lacks height, use random range:")
-        min_h = st.number_input("Min Random Height", value=3.0)
-        max_h = st.number_input("Max Random Height", value=15.0)
+    # --- FORM START ---
+    # Everything inside this 'with' block will NOT trigger a reload until the button is clicked.
+    with st.form("simulation_form"):
+        lat = st.number_input("Latitude", value=6.457211, format="%.6f")
+        lon = st.number_input("Longitude", value=3.559664, format="%.6f")
+        
+        st.header("📏 Parameters")
+        radius = st.slider("Search Radius (m)", 25, 300, 100)
+        tower_height = st.slider("Tower Height (m)", 15, 200, 50)
+        
+        # --- HIDDEN/ADVANCED SETTINGS ---
+        with st.expander("🛠️ Advanced Settings (Height Simulation)"):
+            st.caption("If OSM data lacks height, use random range:")
+            min_h = st.number_input("Min Random Height", value=4.0)
+            max_h = st.number_input("Max Random Height", value=50.0)
 
-    run_btn = st.button("Generate & Validate", type="primary")
+        # The Form Submit Button
+        submitted = st.form_submit_button("Generate & Validate", type="primary")
+    # --- FORM END ---
 
 @st.cache_data
 def process_site(lat, lon, radius, tower_h, min_h, max_h):
@@ -168,27 +179,33 @@ def process_site(lat, lon, radius, tower_h, min_h, max_h):
     max_b_height = builder.get_max_building_height()
     return builder, status, msg, max_b_height
 
-if run_btn:
+# --- EXECUTION LOGIC ---
+# Run if form submitted OR if it's the very first load
+if submitted or st.session_state.first_run:
+    
+    # Turn off the first_run flag so subsequent runs only happen on button click
+    st.session_state.first_run = False
+    
     with st.spinner("Analyzing Site Compliance & Heights..."):
         builder_instance, status, msg, max_b_height = process_site(lat, lon, radius, tower_height, min_h, max_h)
         
         # 1. DISPLAY COMPLIANCE ALERTS
         if status == "COLLISION":
-            st.error(f"🛑 **SITE REJECTED**: {msg}")
+            st.error(f"🛑 **LOCATION NOT FEASIBLE**: {msg}")
         elif status == "VIOLATION":
-            st.warning(f"⚠️ **REGULATORY WARNING**: {msg}")
+            st.warning(f"⚠️ **NCC REGULATION WARNING**: {msg}")
         else:
-            st.success(f"✅ **SITE APPROVED**: {msg}")
+            st.success(f"✅ **SETBACK COMPLIANT**: {msg}")
 
         # 2. DISPLAY HEIGHT ANALYSIS
+        if max_b_height > tower_height:
+             st.info(f"📉 **Line of Sight Warning**: The tallest building ({max_b_height}m) in this area is taller than your mast ({tower_height}m). This may cause signal shadowing.")
+        else:
+             st.caption("Probe: Your mast clears the tallest building in the immediate vicinity.")
+
         col1, col2 = st.columns(2)
         col1.metric("Your Tower Height", f"{tower_height}m")
         col2.metric("Tallest Nearby Building", f"{max_b_height}m")
-
-        if max_b_height > tower_height:
-             st.info(f"📉 **Line of Sight Warning**: The tallest building in this area ({max_b_height}m) is taller than your mast ({tower_height}m). This may cause signal shadowing.")
-        else:
-             st.caption("Probe: Your mast clears the tallest building in the immediate vicinity.")
 
         # 3. RENDER MAP
         if builder_instance.footprints is not None:
@@ -196,7 +213,6 @@ if run_btn:
             st.pydeck_chart(deck)
             
             # 4. DOWNLOAD BUTTON
-            # Prepare CSV: Drop the Pydeck 'coordinates' list, keep Geometry (WKT) and other cols
             df_export = builder_instance.footprints.drop(columns=['coordinates'], errors='ignore')
             csv = df_export.to_csv(index=False).encode('utf-8')
             
